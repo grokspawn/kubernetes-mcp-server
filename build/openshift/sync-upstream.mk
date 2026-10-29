@@ -1,11 +1,16 @@
 ##@ Upstream Sync
 # Sync policy: fail closed on committed merge conflicts and report changed-path
-# overlaps for review. Open downstream PRs are rebased after sync lands.
+# overlaps for review. When the upstream merge conflicts, sync-upstream-pr
+# leaves the sync branch checked out with the merge in progress (conflict
+# markers in the worktree) so a human can resolve it and run
+# 'make sync-upstream-finish' to validate, commit, push, and open the PR.
+# Open downstream PRs are rebased after sync lands.
 
 UPSTREAM_REPO ?= containers/kubernetes-mcp-server
 UPSTREAM_REMOTE ?= upstream
 ORIGIN_REMOTE ?= origin
 SYNC_BRANCH_NAME ?= upstream-sync
+SYNC_STATE_FILE := $(shell git rev-parse --git-path sync-upstream-state)
 OWNER_REPO ?= $(shell git remote get-url $(ORIGIN_REMOTE) | sed 's|https://[^@]*@github\.com/||; s|https://github\.com/||; s|git@github\.com:||; s|\.git$$||')
 
 .PHONY: sync-upstream-check
@@ -27,8 +32,8 @@ sync-upstream-check: ## Check if fork is behind upstream (dry-run)
 		echo "Run 'make sync-upstream-pr' to create a PR"; \
 	fi
 
-.PHONY: sync-upstream-pr sync-upstream-pr-run
-sync-upstream-pr: ## Create/update PR to sync with upstream (requires gh CLI)
+.PHONY: sync-upstream-pr sync-upstream-pr-run sync-upstream-prepare
+sync-upstream-pr: ## Create/update PR to sync with upstream; on conflict, prepare a resolvable sync branch
 	@set -eu; \
 	if [ -n "$$(git status --porcelain)" ]; then \
 		echo "❌ Refusing to sync from a dirty worktree."; \
@@ -66,16 +71,16 @@ sync-upstream-pr: ## Create/update PR to sync with upstream (requires gh CLI)
 		echo "⚠️  Paths changed on both sides since merge-base; review the sync PR carefully:"; \
 		while IFS= read -r path; do printf '  %s\n' "$$path"; done < "$$TMP_DIR/committed-overlaps"; \
 	fi; \
-	if ! git merge-tree --write-tree "$$DOWNSTREAM_SHA" "$$UPSTREAM_SHA" > "$$TMP_DIR/merge-tree.out" 2>&1; then \
-		echo "❌ Upstream/downstream merge preflight found conflicts; no sync branch was created:"; \
-		while IFS= read -r line; do printf '  %s\n' "$$line"; done < "$$TMP_DIR/merge-tree.out"; \
-		exit 1; \
-	fi; \
 	SYNC_REMOTE_REFS=$$(git ls-remote --refs "$(ORIGIN_REMOTE)" "refs/heads/$(SYNC_BRANCH_NAME)") || { echo "❌ Could not inspect the remote sync branch."; exit 1; }; \
 	SYNC_REMOTE_SHA=$$(printf '%s\n' "$$SYNC_REMOTE_REFS" | cut -f1); \
 	ORIGINAL_BRANCH=$$(git symbolic-ref --short HEAD 2>/dev/null || true); \
 	ORIGINAL_SHA=$$(git rev-parse HEAD); \
 	if [ "$$ORIGINAL_BRANCH" = "$(SYNC_BRANCH_NAME)" ]; then echo "❌ Run sync from a branch other than $(SYNC_BRANCH_NAME)."; exit 1; fi; \
+	if ! git merge-tree --write-tree "$$DOWNSTREAM_SHA" "$$UPSTREAM_SHA" > "$$TMP_DIR/merge-tree.out" 2>&1; then \
+		echo "⚠️  Upstream/downstream merge has conflicts; preparing $(SYNC_BRANCH_NAME) for interactive resolution."; \
+		$(MAKE) sync-upstream-prepare UPSTREAM_SHA="$$UPSTREAM_SHA" DOWNSTREAM_SHA="$$DOWNSTREAM_SHA" SYNC_REMOTE_SHA="$$SYNC_REMOTE_SHA"; \
+		exit 1; \
+	fi; \
 	if $(MAKE) sync-upstream-pr-run UPSTREAM_SHA="$$UPSTREAM_SHA" DOWNSTREAM_SHA="$$DOWNSTREAM_SHA" SYNC_REMOTE_SHA="$$SYNC_REMOTE_SHA"; then \
 		SYNC_STATUS=0; \
 	else \
@@ -86,6 +91,52 @@ sync-upstream-pr: ## Create/update PR to sync with upstream (requires gh CLI)
 		if [ -n "$$ORIGINAL_BRANCH" ]; then git checkout "$$ORIGINAL_BRANCH"; else git checkout --detach "$$ORIGINAL_SHA"; fi; \
 	fi; \
 	exit "$$SYNC_STATUS"
+
+sync-upstream-prepare: ## Internal: create the sync branch and start the conflicted merge for human resolution
+	@test -z "$$(git status --porcelain)" || { echo "❌ Refusing to prepare a sync from a dirty worktree."; exit 1; }
+	@test -n "$(UPSTREAM_SHA)" -a -n "$(DOWNSTREAM_SHA)" || { echo "❌ Sync SHAs must be provided by sync-upstream-pr."; exit 1; }
+	@if git show-ref --verify --quiet "refs/heads/$(SYNC_BRANCH_NAME)"; then \
+		LOCAL_SYNC_SHA=$$(git rev-parse "refs/heads/$(SYNC_BRANCH_NAME)"); \
+		if [ "$$LOCAL_SYNC_SHA" != "$(SYNC_REMOTE_SHA)" ]; then \
+			echo "❌ Local $(SYNC_BRANCH_NAME) differs from its inspected remote tip; refusing to reset it."; \
+			exit 1; \
+		fi; \
+	fi
+	@set -eu; \
+	ORIGINAL_BRANCH=$$(git symbolic-ref --short HEAD 2>/dev/null || true); \
+	ORIGINAL_SHA=$$(git rev-parse HEAD); \
+	restore_original() { \
+		if [ -n "$$ORIGINAL_BRANCH" ]; then git checkout -q "$$ORIGINAL_BRANCH"; else git checkout -q --detach "$$ORIGINAL_SHA"; fi; \
+	}; \
+	echo "📝 Creating sync branch from pinned downstream SHA..."; \
+	git checkout -B $(SYNC_BRANCH_NAME) "$(DOWNSTREAM_SHA)"; \
+	echo "🔀 Starting merge of pinned upstream SHA (conflicts expected)..."; \
+	if git merge --no-ff "$(UPSTREAM_SHA)" -m "chore: merge upstream changes"; then \
+		echo "❌ Unexpected: the merge succeeded after the preflight reported conflicts. Aborting."; \
+		git merge --abort 2>/dev/null || true; \
+		git reset -q --hard "$(DOWNSTREAM_SHA)"; \
+		restore_original; \
+		exit 1; \
+	fi; \
+	if [ ! -f "$$(git rev-parse --git-path MERGE_HEAD)" ]; then \
+		echo "❌ The merge failed without entering a conflicted state; nothing to resolve."; \
+		git merge --abort 2>/dev/null || true; \
+		restore_original; \
+		exit 1; \
+	fi; \
+	printf 'DOWNSTREAM_SHA=%s\nUPSTREAM_SHA=%s\nSYNC_REMOTE_SHA=%s\n' \
+		"$(DOWNSTREAM_SHA)" "$(UPSTREAM_SHA)" "$(SYNC_REMOTE_SHA)" > "$(SYNC_STATE_FILE)"; \
+	echo ""; \
+	echo "❌ The upstream merge has conflicts that need human resolution:"; \
+	git diff --name-only --diff-filter=U | sed 's/^/  /'; \
+	echo ""; \
+	echo "You are now on branch '$(SYNC_BRANCH_NAME)' with the merge in progress."; \
+	echo "Next steps:"; \
+	echo "  1. Resolve the conflicts listed above in your working tree"; \
+	echo "  2. Run 'make sync-upstream-finish' to validate, commit, push, and open the sync PR"; \
+	echo ""; \
+	echo "To discard this attempt:"; \
+	echo "  git merge --abort && git checkout - && git branch -D $(SYNC_BRANCH_NAME)"
 
 sync-upstream-pr-run: ## Internal: execute a preflighted sync using pinned commit SHAs
 	@test -z "$$(git status --porcelain)" || { echo "❌ Refusing to reset a sync branch from a dirty worktree."; exit 1; }
@@ -105,8 +156,59 @@ sync-upstream-pr-run: ## Internal: execute a preflighted sync using pinned commi
 		git merge --abort; \
 		exit 1; \
 	fi
+	@$(MAKE) sync-upstream-codegen
+	@$(MAKE) sync-upstream-publish UPSTREAM_SHA="$(UPSTREAM_SHA)" DOWNSTREAM_SHA="$(DOWNSTREAM_SHA)" SYNC_REMOTE_SHA="$(SYNC_REMOTE_SHA)"
+
+.PHONY: sync-upstream-finish
+sync-upstream-finish: ## Finish a human-resolved sync: validate, commit, push, and open the PR
+	@set -eu; \
+	if [ ! -f "$(SYNC_STATE_FILE)" ]; then \
+		echo "❌ No prepared sync found ($(SYNC_STATE_FILE)). Run 'make sync-upstream-pr' first."; \
+		exit 1; \
+	fi; \
+	. "$(SYNC_STATE_FILE)"; \
+	CURRENT_BRANCH=$$(git rev-parse --abbrev-ref HEAD); \
+	if [ "$$CURRENT_BRANCH" != "$(SYNC_BRANCH_NAME)" ]; then \
+		echo "❌ Expected to be on branch '$(SYNC_BRANCH_NAME)' but found '$$CURRENT_BRANCH'."; \
+		echo "   The prepared merge lives on that branch; switch to it and re-run."; \
+		exit 1; \
+	fi; \
+	if [ -f "$$(git rev-parse --git-path MERGE_HEAD)" ]; then \
+		git add -A; \
+		CONFLICT_MARKERS=$$(git diff --cached --check 2>/dev/null | grep 'leftover conflict marker' || true); \
+		if [ -n "$$CONFLICT_MARKERS" ]; then \
+			echo "❌ Conflict markers are still present in the staged resolution:"; \
+			echo "$$CONFLICT_MARKERS" | sed 's/^/  /'; \
+			echo ""; \
+			echo "Finish resolving, then re-run 'make sync-upstream-finish'."; \
+			exit 1; \
+		fi; \
+		echo "📝 Committing the resolved merge..."; \
+		git commit --no-edit; \
+	fi; \
+	if ! git merge-base --is-ancestor "$$DOWNSTREAM_SHA" HEAD; then \
+		echo "❌ HEAD does not contain the pinned downstream SHA ($$DOWNSTREAM_SHA)."; \
+		exit 1; \
+	fi; \
+	if ! git merge-base --is-ancestor "$$UPSTREAM_SHA" HEAD; then \
+		echo "❌ HEAD does not contain the pinned upstream SHA ($$UPSTREAM_SHA)."; \
+		echo "   If upstream moved on, discard this branch and run 'make sync-upstream-pr' again."; \
+		exit 1; \
+	fi; \
+	$(MAKE) sync-upstream-codegen; \
+	$(MAKE) sync-upstream-publish UPSTREAM_SHA="$$UPSTREAM_SHA" DOWNSTREAM_SHA="$$DOWNSTREAM_SHA" SYNC_REMOTE_SHA="$$SYNC_REMOTE_SHA"; \
+	rm -f "$(SYNC_STATE_FILE)"; \
+	CURRENT_BRANCH=$$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true); \
+	if [ -n "$$CURRENT_BRANCH" ] && [ "$$CURRENT_BRANCH" = "$(SYNC_BRANCH_NAME)" ]; then \
+		git checkout - 2>/dev/null || git checkout main 2>/dev/null || true; \
+	fi
+
+.PHONY: sync-upstream-codegen
+sync-upstream-codegen: ## Internal: validate the merged tree and regenerate generated content
 	@echo "🔧 Updating dependencies..."
 	@go mod tidy && go mod vendor
+	@echo "🔨 Validating that the merged tree builds..."
+	@go build ./... || { echo "❌ The merged tree does not compile. Fix the merge resolution before finishing the sync."; exit 1; }
 	@if [ -n "$$(git status --porcelain go.mod go.sum vendor/)" ]; then \
 		echo "📦 Changes detected in generated files. Committing..."; \
 		git add go.mod go.sum vendor/; \
@@ -126,7 +228,9 @@ sync-upstream-pr-run: ## Internal: execute a preflighted sync using pinned commi
 		git add pkg/mcp/testdata; \
 		git commit -m "chore: update test snapshots"; \
 	fi
-	@echo "📤 Pushing sync branch with lease protection..."
+
+.PHONY: sync-upstream-publish
+sync-upstream-publish: ## Internal: push the sync branch with lease protection and create or update the PR
 	@set -eu; \
 	PUSHED_SHA=$$(git rev-parse HEAD); \
 	git merge-base --is-ancestor "$(UPSTREAM_SHA)" "$$PUSHED_SHA"; \
@@ -169,8 +273,3 @@ sync-upstream-pr-run: ## Internal: execute a preflighted sync using pinned commi
 			--base main \
 			--head $(SYNC_BRANCH_NAME); \
 	fi
-	@CURRENT_BRANCH=$$(git rev-parse --abbrev-ref HEAD 2>/dev/null); \
-	if [ -n "$$CURRENT_BRANCH" ] && [ "$$CURRENT_BRANCH" = "$(SYNC_BRANCH_NAME)" ]; then \
-		git checkout - 2>/dev/null || git checkout main 2>/dev/null || true; \
-	fi
-	@echo "✅ Done!"
